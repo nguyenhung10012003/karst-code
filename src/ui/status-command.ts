@@ -6,6 +6,8 @@
  */
 import { spawn } from 'node:child_process';
 import type { StatusLineSettings } from '../config/settings.ts';
+import { shell } from '../tools/shell.ts';
+import { killTree } from '../tools/tasks.ts';
 
 const MIN_GAP_MS = 300;
 const TIMEOUT_MS = 5_000;
@@ -101,7 +103,7 @@ export class StatusCommand {
   /** Its stdout, or null when it failed or took too long, which leaves the last output up. */
   private execute(payload: string): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(process.env.SHELL || '/bin/sh', ['-c', this.settings.command], {
+      const child = spawn(shell(), ['-c', this.settings.command], {
         cwd: this.cwd(),
         env: { ...process.env, COLUMNS: String(process.stdout.columns || 80), LINES: String(process.stdout.rows || 24) },
         stdio: ['pipe', 'pipe', 'ignore'],
@@ -109,11 +111,7 @@ export class StatusCommand {
       });
       let stdout = '';
       const timer = setTimeout(() => {
-        try {
-          if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
-        } catch {
-          // Already gone.
-        }
+        if (child.pid !== undefined) killTree(child.pid, 'SIGKILL');
       }, TIMEOUT_MS);
       child.stdout.on('data', (chunk: Buffer) => {
         if (stdout.length < MAX_OUTPUT_CHARS) stdout += chunk.toString();

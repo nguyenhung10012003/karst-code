@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, win32 } from 'node:path';
 import { describe, it } from 'bun:test';
 import { bashTool } from '../src/tools/bash.ts';
+import { findGitBash, shellName } from '../src/tools/shell.ts';
 import { TaskRegistry } from '../src/tools/tasks.ts';
 import { editTool, readTool, writeTool } from '../src/tools/files.ts';
 import { askUserTool, exitPlanModeTool, todoWriteTool } from '../src/tools/interaction.ts';
@@ -147,7 +148,11 @@ describe('Bash', () => {
     mkdirSync(join(dir, 'sub'));
     await bashTool.execute({ command: 'cd sub; export FOO=bar' }, ctx);
     assert.equal(ctx.cwd(), join(dir, 'sub'));
-    assert.equal((await bashTool.execute({ command: 'pwd; echo "[$FOO]"' }, ctx)).content, `${join(dir, 'sub')}\n[]`);
+    // Git Bash's plain `pwd` prints `/c/...`; `-W` gives the Windows path.
+    const pwd = process.platform === 'win32' ? 'pwd -W' : 'pwd';
+    const [printed, foo] = (await bashTool.execute({ command: `${pwd}; echo "[$FOO]"` }, ctx)).content.split('\n');
+    assert.equal(process.platform === 'win32' ? win32.normalize(printed!) : printed, join(dir, 'sub'));
+    assert.equal(foo, '[]');
   });
 
   it('keeps the directory inside the allowed ones', async () => {
@@ -186,7 +191,12 @@ describe('Bash', () => {
   it('enforces a timeout and kills what the command started', async () => {
     const { dir, ctx } = setup();
     const started = Date.now();
-    const result = await bashTool.execute({ command: `sleep 30 & echo $! > ${dir}/pid; wait`, timeout: 200 }, ctx);
+    // Git Bash's `$!` is its own pid; Windows knows the process by the one in /proc. Bash also
+    // takes longer to start there, so the timeout leaves it time to write the file.
+    const windows = process.platform === 'win32';
+    const pidOf = windows ? 'cat /proc/$!/winpid' : 'echo $!';
+    const pidFile = join(dir, 'pid').replaceAll('\\', '/');
+    const result = await bashTool.execute({ command: `sleep 30 & ${pidOf} > '${pidFile}'; wait`, timeout: windows ? 1500 : 200 }, ctx);
     assert.equal(result.isError, true);
     assert.match(result.content, /timed out/);
     assert.ok(Date.now() - started < 5000);
@@ -229,9 +239,42 @@ describe('Bash', () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.match(readFileSync(logPath, 'utf8'), /from-bg/);
     ctx.tasks.stopAll();
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    assert.throws(() => process.kill(pid, 0));
+    // Windows has no signals: taskkill, itself a process, ends it a little later.
+    for (let waited = 0; waited < 3000 && isAlive(pid); waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(isAlive(pid), false);
     assert.equal(ctx.tasks.running().length, 0);
+  });
+});
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe('shell on Windows', () => {
+  const installed = (...files: string[]) => (path: string) => files.includes(path);
+
+  it('finds Git Bash next to the git.exe on the PATH', () => {
+    const exists = installed('D:\\Tools\\Git\\cmd\\git.exe', 'D:\\Tools\\Git\\bin\\bash.exe');
+    assert.equal(findGitBash({ PATH: 'C:\\Windows\\System32;D:\\Tools\\Git\\cmd' }, exists), 'D:\\Tools\\Git\\bin\\bash.exe');
+    const mingw = installed('D:\\Git\\mingw64\\bin\\git.exe', 'D:\\Git\\bin\\bash.exe');
+    assert.equal(findGitBash({ Path: 'D:\\Git\\mingw64\\bin' }, mingw), 'D:\\Git\\bin\\bash.exe');
+  });
+
+  it('falls back to where Git for Windows installs, and never to WSL', () => {
+    const env = { PATH: 'C:\\Windows\\System32', ProgramFiles: 'C:\\Program Files', LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' };
+    assert.equal(findGitBash(env, installed('C:\\Windows\\System32\\bash.exe', 'C:\\Program Files\\Git\\bin\\bash.exe')), 'C:\\Program Files\\Git\\bin\\bash.exe');
+    assert.equal(findGitBash(env, installed('C:\\Users\\me\\AppData\\Local\\Programs\\Git\\bin\\bash.exe')), 'C:\\Users\\me\\AppData\\Local\\Programs\\Git\\bin\\bash.exe');
+    assert.equal(findGitBash(env, installed('C:\\Windows\\System32\\bash.exe')), null);
+  });
+
+  it('names the shell without its directory or extension', () => {
+    assert.equal(shellName('C:\\Program Files\\Git\\bin\\bash.exe'), 'bash');
+    assert.equal(shellName('/bin/zsh'), 'zsh');
   });
 });
 

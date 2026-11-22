@@ -205,6 +205,7 @@ export function toolSummary(name: string, input: Record<string, unknown>, cwd: s
     case 'Edit':
       return oneLine(shortenPath(pick(input.file_path), cwd));
     case 'Bash':
+    case 'PowerShell':
       return oneLine(pick(input.command));
     case 'Glob':
     case 'Grep':
@@ -232,6 +233,7 @@ export function permissionPreview(name: string, input: Record<string, unknown>):
   };
   switch (name) {
     case 'Bash':
+    case 'PowerShell':
       return clip(String(input.command ?? ''), '');
     case 'Edit':
       return [

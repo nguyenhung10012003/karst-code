@@ -8,7 +8,7 @@
       "regex": "^(help|\\?)$",
       "steps": [
         {
-          "text": "(mock) This is the built-in mock provider. No model is called: each reply comes from a rule that matches what you type.\n\n- `run <command>`: Bash runs the command\n- `read <file>`: Read shows the file\n- `find <pattern>`: Glob lists matching files, such as `find **/*.ts`\n- `grep <regex>`: Grep searches file contents\n- `demo edit`: Write and then Edit a file named mock-demo.txt\n- `demo todo`: a TodoWrite checklist\n- `demo ask`: AskUserQuestion with two options\n- `demo agent`: a subagent that lists files\n- `demo think`: a thinking block before the answer\n- `demo slow`: a 5-second wait, so you can press Esc\n- `demo error`: an API error\n\nTo write your own rules, see \"Mock provider\" in the README."
+          "text": "(mock) This is the built-in mock provider. No model is called: each reply comes from a rule that matches what you type.\n\n- `run <command>`: Bash runs the command\n- `ps <command>`: PowerShell runs the command, on Windows\n- `read <file>`: Read shows the file\n- `find <pattern>`: Glob lists matching files, such as `find **/*.ts`\n- `grep <regex>`: Grep searches file contents\n- `demo edit`: Write and then Edit a file named mock-demo.txt\n- `demo todo`: a TodoWrite checklist\n- `demo ask`: AskUserQuestion with two options\n- `demo agent`: a subagent that lists files\n- `demo think`: a thinking block before the answer\n- `demo slow`: a 5-second wait, so you can press Esc\n- `demo error`: an API error\n\nTo write your own rules, see \"Mock provider\" in the README."
         }
       ]
     },
@@ -16,6 +16,13 @@
       "regex": "^run (.+)$",
       "steps": [
         { "toolCalls": [{ "name": "Bash", "input": { "command": "{{1}}", "description": "Run the command from the mock prompt" } }] },
+        { "text": "(mock) The command returned:\n\n```\n{{result}}\n```" }
+      ]
+    },
+    {
+      "regex": "^ps (.+)$",
+      "steps": [
+        { "toolCalls": [{ "name": "PowerShell", "input": { "command": "{{1}}", "description": "Run the command from the mock prompt" } }] },
         { "text": "(mock) The command returned:\n\n```\n{{result}}\n```" }
       ]
     },

@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { launch } from './bash.ts';
-import { killTree } from './tasks.ts';
+import { DETACH_COMMANDS, killTree, rememberProcessGroup } from './tasks.ts';
 import type { Tool, ToolContext } from './types.ts';
 
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -212,9 +212,10 @@ function startCommand(command: string, description: string, timeoutMs: number, c
   const task = ctx.tasks.track({ command, description, stop: () => watch?.end('stopped', 'was stopped', undefined, true) });
   const label = `"${description}" (task ${task.id})`;
   const log = createWriteStream(task.logPath, { flags: 'a', mode: 0o600 });
-  const child = spawn(target.file, target.args, { cwd: ctx.cwd(), detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: target.env });
+  const child = spawn(target.file, target.args, { cwd: ctx.cwd(), detached: DETACH_COMMANDS, stdio: ['ignore', 'pipe', 'pipe'], env: target.env, windowsHide: true });
   pid = child.pid;
   child.unref();
+  rememberProcessGroup(child, target.env);
   const release = ctx.tasks.guard(pid);
   child.once('exit', release);
   watch = new Watch(label, ctx, timeoutMs, () => {

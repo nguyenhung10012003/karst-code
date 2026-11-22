@@ -302,7 +302,7 @@ Ensure your plan is complete and unambiguous:
         items: {
           type: 'object',
           properties: {
-            tool: { description: 'The tool this prompt applies to', type: 'string', enum: ['Bash'] },
+            tool: { description: 'The tool this prompt applies to', type: 'string', enum: ['Bash', 'PowerShell'] },
             prompt: { description: 'Semantic description of the action, e.g. "run tests", "install dependencies"', type: 'string' },
           },
           required: ['tool', 'prompt'],

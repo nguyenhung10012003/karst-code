@@ -92,7 +92,7 @@ const SUBAGENT_EXCLUDED_TOOLS = new Set([
   'PushNotification',
 ]);
 /** Tools that run code or reach out, removed by --restricted unless --tools names them. */
-const RESTRICTED_TOOLS = new Set(['Bash', 'TaskStop', 'WebFetch', 'Monitor']);
+const RESTRICTED_TOOLS = new Set(['Bash', 'PowerShell', 'TaskStop', 'WebFetch', 'Monitor']);
 /** Someone who typed within this long is taken to be watching, so a notification would be a duplicate. */
 const USER_ACTIVE_MS = 60_000;
 /** The tier names the Agent tool takes for `model`. Any other name is a model id, used as given. */

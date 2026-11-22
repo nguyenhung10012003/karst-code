@@ -4,6 +4,7 @@ import { editTool, readTool, writeTool } from './files.ts';
 import { agentTool, askUserTool, enterPlanModeTool, exitPlanModeTool, listAgentsTool, sendMessageTool, todoWriteTool } from './interaction.ts';
 import { monitorTool } from './monitor.ts';
 import { notebookEditTool } from './notebook.ts';
+import { powerShellTool } from './powershell.ts';
 import { globTool, grepTool } from './search.ts';
 import { enterWorktreeTool, exitWorktreeTool, pushNotificationTool } from './session.ts';
 import { taskStopTool } from './tasks.ts';
@@ -29,6 +30,8 @@ export function builtinTools(): Tool[] {
     listAgentsTool,
     monitorTool,
     notebookEditTool,
+    // Windows only: elsewhere Bash is the shell, and the tool list stays as it was.
+    ...(process.platform === 'win32' ? [powerShellTool] : []),
     pushNotificationTool,
     readTool,
     scheduleWakeupTool,

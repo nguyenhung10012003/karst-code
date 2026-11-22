@@ -2,25 +2,22 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, join, win32 } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { canonicalize, isInside } from '../permissions/rules.ts';
-import { killTree } from './tasks.ts';
+import { shell } from './shell.ts';
+import { DETACH_COMMANDS, killTree, rememberProcessGroup, withProcessGroup } from './tasks.ts';
 import type { Tool, ToolContext, ToolOutput } from './types.ts';
 
-const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_TIMEOUT_MS = 600_000;
+export const DEFAULT_TIMEOUT_MS = 120_000;
+export const MAX_TIMEOUT_MS = 600_000;
 const OUTPUT_LIMIT = 30_000;
 const KILL_GRACE_MS = 2_000;
 /** A command can exit while something it backgrounded still holds the output pipe open. */
 const PIPE_DRAIN_MS = 200;
 
-export function shell(): string {
-  return process.env.SHELL || '/bin/sh';
-}
-
 /** Without this, a model-run `env` would copy the API key into the transcript. */
-function commandEnvironment(ctx: ToolContext): NodeJS.ProcessEnv {
+export function commandEnvironment(ctx: ToolContext): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, PAGER: 'cat', GIT_PAGER: 'cat' };
   for (const name of ctx.secretEnvVars) delete env[name];
   if (ctx.extraPath?.length) env.PATH = [...ctx.extraPath, env.PATH].filter(Boolean).join(delimiter);
@@ -36,7 +33,7 @@ export interface CommandOptions {
 /** The shell invocation for a command, inside the sandbox when one is on, with credentials removed. */
 export function launch(script: string, command: string, options: CommandOptions, ctx: ToolContext): { file: string; args: string[]; env: NodeJS.ProcessEnv } {
   const plain = { file: shell(), args: ['-c', script] };
-  const env = commandEnvironment(ctx);
+  const env = withProcessGroup(commandEnvironment(ctx));
   if (!ctx.wrapCommand) return { ...plain, env };
   const wrapped = ctx.wrapCommand(plain.file, plain.args, { command, unsandboxed: options.unsandboxed });
   return { file: wrapped.file, args: wrapped.args, env: { ...env, ...wrapped.env } };
@@ -68,13 +65,19 @@ class OutputBuffer {
   }
 }
 
-function startInBackground(command: string, limitMs: number | undefined, options: CommandOptions, ctx: ToolContext): ToolOutput {
-  const { file, args, env } = launch(command, command, options, ctx);
-  const task = ctx.tasks.start(file, args, {
+export interface ShellTarget {
+  file: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+/** Starts a shell invocation as a background task. Shared with PowerShell. */
+export function startInBackground(command: string, target: ShellTarget, limitMs: number | undefined, description: string | undefined, ctx: ToolContext): ToolOutput {
+  const task = ctx.tasks.start(target.file, target.args, {
     command,
     cwd: ctx.cwd(),
-    env,
-    ...(options.description ? { description: options.description } : {}),
+    env: target.env,
+    ...(description ? { description } : {}),
     ...(limitMs === undefined ? {} : { limitMs }),
   });
   if (!task) return { content: 'Failed to start background process.', isError: true };
@@ -84,20 +87,64 @@ function startInBackground(command: string, limitMs: number | undefined, options
   };
 }
 
+const GIT_BASH_HINT =
+  'Karst runs commands with Git Bash on Windows. Install Git for Windows, or set SHELL to the full path of bash.exe (e.g. C:\\Program Files\\Git\\bin\\bash.exe) and open a new terminal.';
+
 function runForeground(command: string, timeoutMs: number, options: CommandOptions, ctx: ToolContext): Promise<ToolOutput> {
   const cwdFile = join(tmpdir(), `karst-cwd-${randomUUID()}`);
-  // The shell exits after each call, so its final directory is carried over by hand.
-  const wrapped = `${command}\n__karst_status=$?; pwd -P > '${cwdFile}' 2>/dev/null; exit $__karst_status`;
+  // The shell exits after each call, so its final directory is carried over by hand. Git Bash's
+  // `pwd -P` prints `/c/...`, which Windows cannot resolve; `pwd -W` prints `C:/...`.
+  const pwd = process.platform === 'win32' ? '{ pwd -W || pwd -P; }' : 'pwd -P';
+  const wrapped = `${command}\n__karst_status=$?; ${pwd} > '${cwdFile}' 2>/dev/null; exit $__karst_status`;
+  return runInForeground(
+    {
+      command,
+      timeoutMs,
+      target: launch(wrapped, command, options, ctx),
+      cwdFile,
+      // A bare `sleep` has nothing to come back for, so it stops at its timeout instead.
+      mayMoveToBackground: !/^\s*sleep\b/.test(command),
+      ...(options.description ? { description: options.description } : {}),
+      ...(process.platform === 'win32' ? { missingShellHint: GIT_BASH_HINT } : {}),
+    },
+    ctx,
+  );
+}
+
+export interface ForegroundRun {
+  /** As the model wrote it, for the task list and messages. */
+  command: string;
+  description?: string;
+  timeoutMs: number;
+  target: ShellTarget;
+  /** Where the shell writes the directory it ended in. */
+  cwdFile: string;
+  /** Whether running past the timeout moves it to the background, when the session does that. */
+  mayMoveToBackground: boolean;
+  /** Added to a failure to start, such as what to install. */
+  missingShellHint?: string;
+  /** Files removed once the run is over, however it ended. */
+  scratch?: string[];
+}
+
+/** Runs a shell invocation to completion, a timeout, an interrupt or the background. Shared with PowerShell. */
+export function runInForeground(run: ForegroundRun, ctx: ToolContext): Promise<ToolOutput> {
+  const { command, timeoutMs, target, cwdFile } = run;
+  const options = { description: run.description };
+  const removeScratch = (): void => {
+    for (const file of run.scratch ?? []) rmSync(file, { force: true });
+  };
 
   return new Promise((resolvePromise) => {
     const output = new OutputBuffer();
-    const target = launch(wrapped, command, options, ctx);
     const child = spawn(target.file, target.args, {
       cwd: ctx.cwd(),
-      detached: true,
+      detached: DETACH_COMMANDS,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: target.env,
+      windowsHide: true,
     });
+    rememberProcessGroup(child, target.env);
     // Released when it ends here. Moved to the background, the registry looks after it instead.
     const release = ctx.tasks.guard(child.pid);
     let timedOut = false;
@@ -112,10 +159,11 @@ function runForeground(command: string, timeoutMs: number, options: CommandOptio
     };
     const onAbort = (): void => terminate();
     const timer = setTimeout(() => {
-      if (shouldMoveToBackground(command, ctx) && child.pid !== undefined) {
+      if (ctx.autoBackground === true && run.mayMoveToBackground && child.pid !== undefined) {
         settled = true;
         ctx.signal.removeEventListener('abort', onAbort);
         rmSync(cwdFile, { force: true });
+        removeScratch();
         const task = ctx.tasks.adopt(child, { command, soFar: output.toString(), ...(options.description ? { description: options.description } : {}) });
         resolvePromise({
           content:
@@ -145,10 +193,12 @@ function runForeground(command: string, timeoutMs: number, options: CommandOptio
       ctx.signal.removeEventListener('abort', onAbort);
       child.stdout.destroy();
       child.stderr.destroy();
+      removeScratch();
 
       const notes: string[] = [];
       try {
-        const finalDir = readFileSync(cwdFile, 'utf8').trim();
+        const written = readFileSync(cwdFile, 'utf8').trim();
+        const finalDir = process.platform === 'win32' && written ? win32.normalize(written) : written;
         rmSync(cwdFile, { force: true });
         // A failed command leaves the directory where it was.
         if (code === 0 && finalDir && finalDir !== ctx.cwd()) {
@@ -177,6 +227,7 @@ function runForeground(command: string, timeoutMs: number, options: CommandOptio
 
     child.on('error', (error) => {
       output.append(`Failed to start shell: ${error.message}`);
+      if (run.missingShellHint && (error as NodeJS.ErrnoException).code === 'ENOENT') output.append(`\n${run.missingShellHint}`);
       finish(1, null);
     });
     child.on('close', finish);
@@ -186,13 +237,16 @@ function runForeground(command: string, timeoutMs: number, options: CommandOptio
   });
 }
 
-/** A bare `sleep` has nothing to come back for, so it stops at its timeout instead. */
-function shouldMoveToBackground(command: string, ctx: ToolContext): boolean {
-  return ctx.autoBackground === true && !/^\s*sleep\b/.test(command);
-}
-
 /** A leading `sleep` of this many seconds or more is refused in the foreground. */
-const MIN_BLOCKED_SLEEP_SECONDS = 2;
+export const MIN_BLOCKED_SLEEP_SECONDS = 2;
+
+export const BLOCKED_SLEEP_MESSAGE =
+  'Foreground sleep is blocked. To wait for something, run a command that exits when it is ready with run_in_background (you are notified when it exits), or use Monitor with an until-loop.';
+
+/** The requested timeout, within bounds. */
+export function foregroundTimeout(requested: number | undefined): number {
+  return Math.min(Math.max(requested ?? DEFAULT_TIMEOUT_MS, 1), MAX_TIMEOUT_MS);
+}
 
 function blockedSleep(command: string): boolean {
   // Only a bare `sleep N` as the whole command, not a sleep inside a larger pipeline or script.
@@ -254,14 +308,8 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
       ...(input.description ? { description: input.description as string } : {}),
     };
     const requested = input.timeout as number | undefined;
-    if (input.run_in_background === true) return startInBackground(command, requested, options, ctx);
-    if (blockedSleep(command)) {
-      return {
-        content:
-          'Foreground sleep is blocked. To wait for something, run a command that exits when it is ready with run_in_background (you are notified when it exits), or use Monitor with an until-loop.',
-        isError: true,
-      };
-    }
-    return runForeground(command, Math.min(Math.max(requested ?? DEFAULT_TIMEOUT_MS, 1), MAX_TIMEOUT_MS), options, ctx);
+    if (input.run_in_background === true) return startInBackground(command, launch(command, command, options, ctx), requested, options.description, ctx);
+    if (blockedSleep(command)) return { content: BLOCKED_SLEEP_MESSAGE, isError: true };
+    return runForeground(command, foregroundTimeout(requested), options, ctx);
   },
 };

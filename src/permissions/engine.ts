@@ -22,6 +22,18 @@ import {
 } from './bash-policy.ts';
 import type { BashContext } from './bash-policy.ts';
 import {
+  analyzePowerShell,
+  hasRiskyLocationChange,
+  isAcceptEditsPowerShell,
+  isCriticalRemovalPowerShell,
+  isReadOnlyPowerShell,
+  powerShellAllowForm,
+  powerShellForms,
+  powerShellReadPaths,
+  powerShellWritePaths,
+} from './powershell-policy.ts';
+import type { PsCommand } from './powershell-policy.ts';
+import {
   canonicalize,
   isInside,
   isProtectedPath,
@@ -44,6 +56,7 @@ export type AccessRequest =
   | { kind: 'read'; paths: string[] }
   | { kind: 'edit'; paths: string[] }
   | { kind: 'bash'; command: string; unsandboxed?: boolean }
+  | { kind: 'powershell'; command: string }
   | { kind: 'web'; url: string }
   /** `readOnlyHint` comes from the server, so it can never skip a prompt, only avoid a refusal. */
   | { kind: 'mcp'; readOnlyHint: boolean }
@@ -127,9 +140,10 @@ export class PermissionEngine {
     this.turnRules = [];
   }
 
-  /** A bare deny rule takes the tool out of the model's context entirely. */
+  /** A bare deny rule takes the tool out of the model's context entirely. Denying Bash denies PowerShell too. */
   isToolRemoved(toolName: string): boolean {
-    return this.rules.some((r) => r.behavior === 'deny' && r.specifier === undefined && ruleCoversTool(r, toolName));
+    const names = toolName === 'PowerShell' ? ['PowerShell', 'Bash'] : [toolName];
+    return this.rules.some((r) => r.behavior === 'deny' && r.specifier === undefined && names.some((name) => ruleCoversTool(r, name)));
   }
 
   isPathDenied(toolName: string, path: string): boolean {
@@ -148,6 +162,8 @@ export class PermissionEngine {
     switch (access.kind) {
       case 'bash':
         return this.evaluateBash(toolName, access.command, hook, access.unsandboxed === true);
+      case 'powershell':
+        return this.evaluatePowerShell(toolName, access.command, hook);
       case 'read':
         return this.evaluateRead(toolName, access.paths, hook);
       case 'edit':
@@ -417,6 +433,83 @@ export class PermissionEngine {
     const text = allowForm(cmd);
     if (text === null || text === '') return false;
     return allowRules.some((rule) => rule.specifier !== undefined && matchBashPattern(rule.specifier, text));
+  }
+
+  /**
+   * As for Bash, with PowerShell's own analysis. There is no sandbox for it. Rules match without
+   * regard to case, as PowerShell runs commands, and through aliases: a deny rule for
+   * `Remove-Item` also covers `rm` and `del`. Bash's deny and ask rules apply too, so a command
+   * kept from Bash is not one tool away; its allow rules do not.
+   */
+  private evaluatePowerShell(toolName: string, command: string, hook: HookVerdict): Decision {
+    const analysis = analyzePowerShell(command);
+    const ctx = this.bashContext();
+    const texts = [command.trim().toLowerCase(), ...analysis.commands.flatMap(powerShellForms)];
+    const restrictedBy = (behavior: RuleBehavior): PermissionRule | undefined =>
+      [...this.rulesFor(behavior, toolName), ...this.rulesFor(behavior, 'Bash')].find(
+        (rule) => rule.specifier === undefined || texts.some((text) => matchBashPattern(rule.specifier!.toLowerCase(), text)),
+      );
+
+    const denied = restrictedBy('deny');
+    if (denied) return { behavior: 'deny', reason: `Denied by rule ${denied.text}` };
+    const fileDenied = this.deniedPaths(
+      analysis.commands.flatMap((cmd) => powerShellWritePaths(cmd, ctx.cwd)),
+      analysis.commands.flatMap((cmd) => powerShellReadPaths(cmd, ctx.cwd)),
+    );
+    if (fileDenied) return { behavior: 'deny', reason: fileDenied };
+    if (analysis.commands.some((cmd) => isCriticalRemovalPowerShell(cmd, ctx))) {
+      return { behavior: 'ask', reason: 'Removes a critical path, or one that cannot be determined', forced: true };
+    }
+    const asked = restrictedBy('ask');
+    if (asked) return { behavior: 'ask', reason: `Rule ${asked.text} requires confirmation`, forced: true };
+    if (this.mode === 'bypassPermissions') return { behavior: 'allow', reason: 'bypassPermissions mode' };
+
+    const risky = hasRiskyLocationChange(analysis.commands);
+    const readOnly =
+      analysis.parseable && analysis.commands.length > 0 && analysis.commands.every((cmd) => isReadOnlyPowerShell(cmd, ctx)) && !risky;
+    if (this.mode === 'plan') {
+      return readOnly
+        ? { behavior: 'allow', reason: 'Read-only command' }
+        : { behavior: 'deny', reason: 'Plan mode only allows read-only shell commands' };
+    }
+    if (hook === 'ask') return { behavior: 'ask', reason: 'A hook requires confirmation' };
+    if (hook === 'allow') return { behavior: 'allow', reason: 'Approved by a hook' };
+    if (readOnly) return { behavior: 'allow', reason: 'Read-only command' };
+
+    const allowRules = this.rulesFor('allow', toolName);
+    if (allowRules.some((rule) => rule.specifier === undefined)) return { behavior: 'allow', reason: 'Approved by an allow rule' };
+    if (!analysis.parseable) return { behavior: 'ask', reason: `Command could not be fully analyzed: ${analysis.reason}` };
+    if (risky) return { behavior: 'ask', reason: 'Changes directory before running git or writing a file' };
+
+    const approved = (cmd: PsCommand): boolean => {
+      if (isReadOnlyPowerShell(cmd, ctx)) return true;
+      if (this.mode === 'acceptEdits' && isAcceptEditsPowerShell(cmd, ctx)) return true;
+      const forms = powerShellForms(cmd);
+      return allowRules.some((rule) => rule.specifier !== undefined && forms.some((form) => matchBashPattern(rule.specifier!.toLowerCase(), form)));
+    };
+    const uncovered = analysis.commands.filter((cmd) => !approved(cmd));
+    if (uncovered.length === 0) return { behavior: 'allow', reason: 'Approved by allow rules' };
+    return {
+      behavior: 'ask',
+      reason: 'PowerShell command needs approval',
+      suggestions: uncovered.slice(0, 5).flatMap((cmd) => {
+        const text = powerShellAllowForm(cmd);
+        return text && !text.includes('*') ? [{ rule: `${toolName}(${text})`, persist: true }] : [];
+      }),
+    };
+  }
+
+  /** The first Edit deny rule a written path meets, or Read deny rule a read one does. */
+  private deniedPaths(writes: string[], reads: string[]): string | undefined {
+    for (const path of writes) {
+      const rule = this.matchPathRules('deny', 'Edit', [path]);
+      if (rule?.specifier !== undefined) return `Denied by rule ${rule.text}`;
+    }
+    if (reads.length > 0) {
+      const rule = this.matchPathRules('deny', 'Read', reads);
+      if (rule?.specifier !== undefined) return `Denied by rule ${rule.text}`;
+    }
+    return undefined;
   }
 
   /** Read and Edit deny rules also apply to what a shell command visibly reads or writes. */

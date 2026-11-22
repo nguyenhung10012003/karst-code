@@ -5,7 +5,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { platform, release, type } from 'node:os';
-import { shell } from '../tools/bash.ts';
+import { shellName } from '../tools/shell.ts';
 import type { SystemBlock } from './provider.ts';
 import { renderInstructions } from './instructions.ts';
 import type { InstructionFile } from './instructions.ts';
@@ -153,7 +153,7 @@ function sessionSections(options: PromptOptions, decisions: PromptDecisions): Pr
       ...(options.additionalDirectories.length > 0 ? [` - Additional working directories: ${options.additionalDirectories.map((dir) => `\`${dir}\``).join(', ')}`] : []),
       ` - Is a git repository: ${git !== null}`,
       ` - Platform: ${platform()}`,
-      ` - Shell: ${shell().split('/').pop()}`,
+      ` - Shell: ${shellName()}`,
       ` - OS Version: ${type()} ${release()}`,
       ...(options.model ? [` - ${modelIdentity(options.model)}`] : []),
       ...(options.scratchpadDir ? [SCRATCHPAD_NOTE(options.scratchpadDir)] : []),

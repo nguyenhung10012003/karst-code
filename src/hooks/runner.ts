@@ -8,6 +8,8 @@ import { basename } from 'node:path';
 import type { HookGroup, HookHandler, HooksConfig } from '../config/settings.ts';
 import { debug } from '../core/debug.ts';
 import { matchBashPattern, parseRule } from '../permissions/rules.ts';
+import { shell } from '../tools/shell.ts';
+import { killTree } from '../tools/tasks.ts';
 
 export type HookEvent =
   | 'SessionStart'
@@ -127,7 +129,7 @@ interface CommandOutcome {
 function runCommand(handler: HookHandler, payload: string, cwd: string, env: Record<string, string>, signal?: AbortSignal): Promise<CommandOutcome> {
   return new Promise((resolve) => {
     // With `args` nothing goes through a shell, so a value cannot be re-parsed as syntax.
-    const [file, args] = handler.args ? [handler.command!, handler.args] : [process.env.SHELL || '/bin/sh', ['-c', handler.command!]];
+    const [file, args] = handler.args ? [handler.command!, handler.args] : [shell(), ['-c', handler.command!]];
     const child = spawn(file, args, {
       cwd,
       env: { ...process.env, ...env, ...handler.env },
@@ -138,11 +140,7 @@ function runCommand(handler: HookHandler, payload: string, cwd: string, env: Rec
     let stderr = '';
     let timedOut = false;
     const kill = (): void => {
-      try {
-        if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        // Already gone.
-      }
+      if (child.pid !== undefined) killTree(child.pid, 'SIGKILL');
     };
     const timer = setTimeout(() => {
       timedOut = true;

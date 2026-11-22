@@ -507,6 +507,7 @@ Besides the file, search, Bash and WebFetch tools, the model has:
 - **Monitor**: runs a long-lived script or WebSocket, and each line of stdout becomes a notification in the conversation (interactive sessions only). While the session is idle, an event waits 1.5 seconds before it starts a turn, so events close together share one.
 - **CronCreate, CronDelete, CronList, ScheduleWakeup**: scheduled prompts and the self-paced `/loop` (interactive sessions only). See Scheduled prompts and /loop.
 - **EnterWorktree, ExitWorktree**: work in a separate git worktree, only when you or the instructions ask for it explicitly.
+- **PowerShell** (Windows only): runs commands in PowerShell 7 when it is installed, else Windows PowerShell 5.1, beside Bash, which on Windows is Git Bash: found next to `git.exe` or where Git for Windows installs, or named by `SHELL`. `cd` carries over between calls as in Bash, and commands can run in the background. Rules are written `PowerShell(npm test *)` and match without regard to case and through aliases, so a deny rule for `Remove-Item *` also stops `rm` and `del`. Bash's deny and ask rules apply to it as well, and denying `Bash` removes it too; Bash's allow rules do not carry over. Only commands with literal arguments that read inside the working directories run without asking; variables, `$(...)`, script blocks and redirection to a file always ask. There is no sandbox for it.
 - **PushNotification**: a desktop notification when something is worth coming back for (interactive sessions only).
 - **WebSearch**: web search through Anthropic's server tool. Turn it off with the rule `"deny": ["WebSearch"]`.
 
@@ -535,7 +536,7 @@ mkdir -p /tmp/play && cd /tmp/play
 karst --provider scripted       # from source: bun run start --provider scripted
 ```
 
-With no `KARST_SCRIPT`, it uses the built-in rules in `src/providers/mock-demo.json`. Type `help` to list them: `run <command>`, `read <file>`, `find <pattern>`, `grep <regex>`, and `demo edit`, `demo todo`, `demo ask`, `demo agent`, `demo think`, `demo slow` and `demo error`.
+With no `KARST_SCRIPT`, it uses the built-in rules in `src/providers/mock-demo.json`. Type `help` to list them: `run <command>`, `ps <command>` (PowerShell, on Windows), `read <file>`, `find <pattern>`, `grep <regex>`, and `demo edit`, `demo todo`, `demo ask`, `demo agent`, `demo think`, `demo slow` and `demo error`.
 
 **Your own rules.** Set `KARST_SCRIPT` to a JSON file:
 

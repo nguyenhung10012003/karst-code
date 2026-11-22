@@ -9,6 +9,7 @@ import { appendFileSync, closeSync, createWriteStream, mkdirSync, openSync, stat
 import type { WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import type { Reaper } from './reaper.ts';
+import { shell } from './shell.ts';
 import type { Tool } from './types.ts';
 
 const KILL_GRACE_MS = 2_000;
@@ -44,11 +45,111 @@ export interface TaskRegistryOptions {
   maxLogBytes?: number;
 }
 
+/**
+ * Commands run in process groups of their own, so a timeout can end everything they started.
+ * Windows has no process groups. There a command gets a hidden console of its own instead
+ * (`windowsHide` without `detached`): with none at all, PowerShell prints nothing, and sharing
+ * Karst's would let it draw over the screen.
+ */
+export const DETACH_COMMANDS = process.platform !== 'win32';
+
+/** When each process was ended on Windows, so the KILL that follows a TERM is not sent too. */
+const endedOnWindows = new Map<number, number>();
+const WINDOWS_REUSE_GUARD_MS = 10_000;
+/** Set in a command's environment on Windows, so every process it starts can be found again. */
+const WINDOWS_GROUP_VAR = 'KARST_PROCESS_GROUP';
+const windowsGroups = new Map<number, string>();
+
+/** On Windows, marks a command's environment with a group of its own. Elsewhere it is unchanged. */
+export function withProcessGroup(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return process.platform === 'win32' ? { ...env, [WINDOWS_GROUP_VAR]: randomBytes(8).toString('hex') } : env;
+}
+
+/** Ties a started command to the group in its environment, for `killTree`. Cleared when it exits. */
+export function rememberProcessGroup(child: ChildProcess, env: NodeJS.ProcessEnv | undefined): void {
+  const group = env?.[WINDOWS_GROUP_VAR];
+  const pid = child.pid;
+  if (process.platform !== 'win32' || !group || pid === undefined) return;
+  windowsGroups.set(pid, group);
+  child.once('exit', () => setTimeout(() => windowsGroups.delete(pid), WINDOWS_REUSE_GUARD_MS).unref());
+}
+
 export function killTree(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform === 'win32') {
+    killTreeOnWindows(pid, signal);
+    return;
+  }
   try {
     process.kill(-pid, signal);
   } catch {
     // The process group has already gone.
+  }
+}
+
+/**
+ * Prints the Windows pid of every MSYS process whose environment holds the group, using only
+ * bash builtins: a fork costs tens of milliseconds on Windows.
+ */
+const FIND_GROUP = `
+for d in /proc/[0-9]*; do
+  while IFS= read -r -d '' entry; do
+    if [ "$entry" = "$1" ]; then read -r w < "$d/winpid" && echo "$w"; break; fi
+  done < "$d/environ"
+done 2>/dev/null`;
+
+/**
+ * Windows has neither process groups nor TERM, so `process.kill(-pid)` does nothing there.
+ * taskkill ends a process and its descendants, but only those Windows still sees as such: an
+ * MSYS program Git Bash started with `&` or in a pipeline has lost its parent, so it is found
+ * by the group in its environment instead. A second, forced call shortly after would find the
+ * process gone, or its pid reused by an unrelated one, so it is skipped.
+ */
+function killTreeOnWindows(pid: number, signal: NodeJS.Signals): void {
+  const now = Date.now();
+  for (const [ended, at] of endedOnWindows) if (now - at > WINDOWS_REUSE_GUARD_MS) endedOnWindows.delete(ended);
+  if (signal === 'SIGKILL' && endedOnWindows.has(pid)) return;
+  endedOnWindows.set(pid, now);
+  const taskkill = (pids: number[]): void => {
+    try {
+      const child = spawn('taskkill', [...pids.flatMap((p) => ['/pid', String(p)]), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      child.on('error', () => {});
+      child.unref();
+    } catch {
+      // taskkill could not start; there is nothing else to try.
+    }
+  };
+  taskkill([pid]);
+  const group = windowsGroups.get(pid);
+  if (!group) return;
+  // Orphans outlive the process tree's end, so they can be looked for meanwhile.
+  let found = '';
+  try {
+    const finder = spawn(shell(), ['-c', FIND_GROUP, 'find-group', `${WINDOWS_GROUP_VAR}=${group}`], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    finder.stdout.on('data', (chunk: Buffer) => (found += chunk.toString()));
+    finder.on('error', () => {});
+    finder.on('close', () => {
+      const orphans = found.split(/\s+/).filter(Boolean).map(Number).filter((p) => p > 0 && p !== pid);
+      if (orphans.length > 0) taskkill(orphans);
+    });
+    finder.unref();
+  } catch {
+    // No shell to look with; the tree itself has been ended.
+  }
+}
+
+/** Copies a running command's pipes to its log, after `soFar`. */
+function copyToLog(child: ChildProcess, logPath: string, soFar: string): void {
+  const log: WriteStream = createWriteStream(logPath, { flags: 'a', mode: 0o600 });
+  if (soFar) log.write(soFar);
+  // The session must be able to exit while this runs. It is stopped at shutdown.
+  child.unref();
+  let open = 2;
+  for (const stream of [child.stdout, child.stderr]) {
+    (stream as unknown as { unref?: () => void } | null)?.unref?.();
+    stream?.on('data', (chunk: Buffer) => log.write(chunk));
+    stream?.once('close', () => {
+      if (--open === 0) log.end();
+    });
   }
 }
 
@@ -175,9 +276,20 @@ export class TaskRegistry {
   start(file: string, args: string[], options: { command: string; description?: string; cwd: string; env: NodeJS.ProcessEnv; limitMs?: number }): BackgroundTask | null {
     const id = randomBytes(4).toString('hex');
     const logPath = this.newLogPath(id);
+    if (process.platform === 'win32') {
+      // Windows opens a file for appending with append-only access, which Git Bash cannot write
+      // to, so the output comes through pipes and is copied to the log here.
+      const child = spawn(file, args, { cwd: options.cwd, detached: DETACH_COMMANDS, stdio: ['ignore', 'pipe', 'pipe'], env: options.env, windowsHide: true });
+      child.on('error', () => {});
+      if (child.pid === undefined) return null;
+      rememberProcessGroup(child, options.env);
+      copyToLog(child, logPath, '');
+      return this.register(child, options.command, logPath, id, options.description, this.limitFor(options.limitMs));
+    }
     const fd = openSync(logPath, 'a', 0o600);
     try {
       const child = spawn(file, args, { cwd: options.cwd, detached: true, stdio: ['ignore', fd, fd], env: options.env });
+      child.on('error', () => {});
       child.unref();
       if (child.pid === undefined) return null;
       return this.register(child, options.command, logPath, id, options.description, this.limitFor(options.limitMs));
@@ -193,18 +305,7 @@ export class TaskRegistry {
   adopt(child: ChildProcess, options: { command: string; description?: string; soFar: string }): BackgroundTask {
     const id = randomBytes(4).toString('hex');
     const logPath = this.newLogPath(id);
-    const log: WriteStream = createWriteStream(logPath, { flags: 'a', mode: 0o600 });
-    log.write(options.soFar);
-    // The session must be able to exit while this runs. It is stopped at shutdown.
-    child.unref();
-    let open = 2;
-    for (const stream of [child.stdout, child.stderr]) {
-      (stream as unknown as { unref?: () => void } | null)?.unref?.();
-      stream?.on('data', (chunk: Buffer) => log.write(chunk));
-      stream?.once('close', () => {
-        if (--open === 0) log.end();
-      });
-    }
+    copyToLog(child, logPath, options.soFar);
     return this.register(child, options.command, logPath, id, options.description, this.limitFor(undefined));
   }
 
