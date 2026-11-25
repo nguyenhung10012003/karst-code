@@ -1,7 +1,7 @@
 /** Adding, listing and removing providers, saving keys and choosing the default. Used by `karst provider` and /provider. */
 import { existsSync } from 'node:fs';
 import { deleteKey, saveKey } from '../config/credentials.ts';
-import { userSettingsPath } from '../config/paths.ts';
+import { APP_DISPLAY_NAME, userSettingsPath } from '../config/paths.ts';
 import { settingsPathFor, updateSettingsFile } from '../config/settings.ts';
 import type { SettingsScope } from '../config/settings.ts';
 import { ensureWorkspaceDir } from '../config/workspace.ts';
@@ -116,6 +116,22 @@ export function saveProviderKey(name: string, config: ProviderConfig, key: strin
   const type = providerTypeName(name, config);
   if (!type) throw new Error(`Unknown provider "${name}".`);
   saveKey(name, key, PROVIDER_TYPES[type]!.endpoint(config));
+}
+
+/**
+ * Why a saved key for this provider is not the one in use, or undefined when it is. A key in a
+ * variable takes precedence, so saving a new key while one is set would otherwise appear to work
+ * and change nothing. `settingsEnv` is the `env` block of settings, which sets variables at startup.
+ */
+export function keyOverride(name: string, config: ProviderConfig, settingsEnv: Record<string, string> = {}): string | undefined {
+  const type = providerTypeName(name, config);
+  if (!type) return undefined;
+  const variable = PROVIDER_TYPES[type]!.keyVars(config).find((candidate) => settingsEnv[candidate] || process.env[candidate]);
+  if (!variable) return undefined;
+  const inSettings = Boolean(settingsEnv[variable]);
+  const where = inSettings ? 'in the "env" block of your settings' : 'in your environment';
+  const fix = inSettings ? 'remove it from there' : 'unset it (check your shell profile)';
+  return `${variable} is set ${where} and takes precedence, so ${APP_DISPLAY_NAME} keeps using that key, not the saved one. To use the saved key, ${fix} and start ${APP_DISPLAY_NAME} again.`;
 }
 
 export function forgetProviderKey(name: string): boolean {

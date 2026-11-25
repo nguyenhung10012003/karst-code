@@ -7,6 +7,7 @@ import {
   ADDABLE_TYPES,
   clearDefaultProvider,
   forgetProviderKey,
+  keyOverride,
   keyWarning,
   modelChoices,
   providerProblem,
@@ -117,6 +118,8 @@ async function addFlow(runtime: Runtime, io: CommandIO, presetName: string | und
   const key = await io.ask(`API key for ${name} (Enter for none; saved in ${credentialsPath()}): `, { secret: true });
   if (key === null) return { output: 'Nothing added.' };
   if (key) saveProviderKey(name, config, key);
+  const override = key ? keyOverride(name, config, runtime.settings.env) : undefined;
+  if (override) out.push(`Warning: ${override}`);
 
   const candidate = createProvider(name, config);
   const model = await chooseModel(runtime, candidate, undefined, io, out);
@@ -144,8 +147,13 @@ async function keyFlow(runtime: Runtime, name: string, io: CommandIO): Promise<C
   if (!key) return { output: [...out, 'No key entered, so nothing changed.'].join('\n') };
   saveProviderKey(name, config, key);
   out.push(`Saved the key for ${name}.`);
-  // The running provider read its key when it was created, so it is made again to pick this one up.
-  if (name === runtime.providerName) out.push(...runtime.useProvider(name, runtime.agent.model));
+  const override = keyOverride(name, config, runtime.settings.env);
+  if (override) {
+    out.push(`Warning: ${override}`);
+  } else if (name === runtime.providerName) {
+    // The running provider read its key when it was created, so it is made again to pick this one up.
+    out.push(...runtime.useProvider(name, runtime.agent.model));
+  }
   return { output: out.join('\n') };
 }
 

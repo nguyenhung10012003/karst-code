@@ -13,6 +13,7 @@ import {
   ADDABLE_TYPES,
   clearDefaultProvider,
   forgetProviderKey,
+  keyOverride,
   keyWarning,
   modelChoices,
   providerProblem,
@@ -75,9 +76,9 @@ function readAllStdin(): Promise<string> {
   });
 }
 
-function loadConfigs(cwd: string): { providers: Record<string, ProviderConfig>; defaultProvider: string; warnings: string[] } {
+function loadConfigs(cwd: string): { providers: Record<string, ProviderConfig>; defaultProvider: string; env: Record<string, string>; warnings: string[] } {
   const settings = loadSettings({ cwd, trusted: isTrusted(cwd) });
-  return { providers: settings.providers, defaultProvider: settings.provider ?? DEFAULT_PROVIDER, warnings: settings.warnings };
+  return { providers: settings.providers, defaultProvider: settings.provider ?? DEFAULT_PROVIDER, env: settings.env, warnings: settings.warnings };
 }
 
 function runList(cwd: string): number {
@@ -113,7 +114,7 @@ async function runAdd(argv: string[], cwd: string): Promise<number> {
   });
   const name = requireArg(positionals[0], 'a provider name').toLowerCase();
   const scope = parseScope(values.scope);
-  const { providers } = loadConfigs(cwd);
+  const { providers, env } = loadConfigs(cwd);
 
   let type = values.type ?? (BUILTIN_PROVIDERS.includes(name) ? name : providers[name]?.type);
   if (!type && interactive()) {
@@ -160,6 +161,8 @@ async function runAdd(argv: string[], cwd: string): Promise<number> {
     if (key) {
       saveProviderKey(name, config, key);
       savedKey = true;
+      const override = keyOverride(name, config, env);
+      if (override) process.stderr.write(`Warning: ${override}\n`);
     }
   }
 
@@ -184,7 +187,7 @@ async function runAdd(argv: string[], cwd: string): Promise<number> {
 async function runKey(argv: string[], cwd: string): Promise<number> {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { stdin: { type: 'boolean' }, delete: { type: 'boolean' } } });
   const name = requireArg(positionals[0], 'a provider name');
-  const { providers } = loadConfigs(cwd);
+  const { providers, env } = loadConfigs(cwd);
   const type = providerTypeName(name, providers[name]);
   if (!type || type === 'scripted') throw new Error(`Unknown provider "${name}". See: ${APP_NAME} provider list`);
   if (values.delete) {
@@ -204,6 +207,8 @@ async function runKey(argv: string[], cwd: string): Promise<number> {
   }
   saveProviderKey(name, config, key);
   process.stdout.write(`Saved the key for ${name} in ${credentialsPath()}, for ${PROVIDER_TYPES[type]!.endpoint(config)} only.\n`);
+  const override = keyOverride(name, config, env);
+  if (override) process.stderr.write(`Warning: ${override}\n`);
   return 0;
 }
 
